@@ -1,0 +1,6 @@
+**/__pycache__/**
+runs/
+data/
+outputs/
+videos/
+.venv/
