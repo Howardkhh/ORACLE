@@ -23,7 +23,9 @@ uv pip install -e CausalPFN
 
 ### Download real and oracle data
 
-Download from here and unzip the data into `Cartpole/`.
+Download from [here](https://drive.google.com/file/d/1CaZDCUpWNVOF34nXT6P9VM59sCKLZVhT/view?usp=sharing) and unzip the data into `Cartpole/`.
+
+Note the oracle data has not been tested. There might be issue with them. Use with caution.
 
 ```bash
 Cartpole
