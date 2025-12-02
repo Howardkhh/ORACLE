@@ -7,15 +7,47 @@ import torch
 import tyro
 from causalpfn import CATEEstimator
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 
 @dataclass
 class Args:
     data_type: Literal["random", "dqn", "mix"]
     data_folder: str = "data/"
     env_id: str = "CartPole-v1"
-    reward_mapping: Literal["original", "angle"] = "original"
+    reward_mapping: Literal["original", "angle"] = "angle"
     cuda: bool = True
-    validation_split: float = 0.3
+
+def load_data(args: Args, validation: bool):
+    if args.data_type == "random" or args.data_type == "dqn":
+        with np.load(f"{args.data_folder}/{args.env_id}/{args.data_type}{'_remapped' if args.reward_mapping == 'angle' else ''}{'_validation' if validation else ''}.npz") as data:
+            X = data["states"].astype(np.float32)
+            T = data["actions"].astype(np.float32)
+            Y = np.concatenate([data["rewards"].astype(np.float32)[:, np.newaxis], data["next_states"].astype(np.float32), data["dones"].astype(np.float32)[:, np.newaxis]], axis=1)
+            done = data["dones"]
+    elif args.data_type == "mix":
+        with np.load(f"{args.data_folder}/{args.env_id}/random{'_remapped' if args.reward_mapping == 'angle' else ''}{'_validation' if validation else ''}.npz") as data:
+            X_random = data["states"].astype(np.float32)
+            T_random = data["actions"].astype(np.float32)
+            Y_random = np.concatenate([data["rewards"].astype(np.float32)[:, np.newaxis], data["next_states"].astype(np.float32), data["dones"].astype(np.float32)[:, np.newaxis]], axis=1)
+            done_random = data["dones"]
+        with np.load(f"{args.data_folder}/{args.env_id}/dqn{'_remapped' if args.reward_mapping == 'angle' else ''}{'_validation' if validation else ''}.npz") as data:
+            X_dqn = data["states"].astype(np.float32)
+            T_dqn = data["actions"].astype(np.float32)
+            Y_dqn = np.concatenate([data["rewards"].astype(np.float32)[:, np.newaxis], data["next_states"].astype(np.float32), data["dones"].astype(np.float32)[:, np.newaxis]], axis=1)
+            done_dqn = data["dones"]
+
+        rand_idx1 = np.random.randint(0, len(X_random), size=len(X_random) // 2)
+        rand_idx2 = np.random.randint(0, len(X_dqn), size=len(X_random) // 2)
+        
+        X = np.concatenate([X_random[rand_idx1], X_dqn[rand_idx2]], axis=0)
+        T = np.concatenate([T_random[rand_idx1], T_dqn[rand_idx2]], axis=0)
+        Y = np.concatenate([Y_random[rand_idx1], Y_dqn[rand_idx2]], axis=0)
+        done = np.concatenate([done_random[rand_idx1], done_dqn[rand_idx2]], axis=0)
+    else:
+        raise ValueError("Unknown data type")
+    
+    return X, T, Y, done
+    
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
@@ -23,39 +55,12 @@ if __name__ == "__main__":
     device = torch.device("cuda:0" if args.cuda and torch.cuda.is_available() else "cpu")
 
     # Load data
-    if args.data_type == "random" or args.data_type == "dqn":
-        with np.load(f"{args.data_folder}/{args.env_id}/{args.data_type}.npz") as data:
-            X = data["states"].astype(np.float32)
-            T = data["actions"].astype(np.float32)
-            Y = np.concatenate([data["rewards"].astype(np.float32)[:, np.newaxis], data["next_states"].astype(np.float32), data["dones"].astype(np.float32)[:, np.newaxis]], axis=1)
-            done = data["dones"]
-    elif args.data_type == "mix":
-        with np.load(f"{args.data_folder}/{args.env_id}/random.npz") as data:
-            X_random = data["states"].astype(np.float32)
-            T_random = data["actions"].astype(np.float32)
-            Y_random = np.concatenate([data["rewards"].astype(np.float32)[:, np.newaxis], data["next_states"].astype(np.float32), data["dones"].astype(np.float32)[:, np.newaxis]], axis=1)
-            done_random = data["dones"]
-        with np.load(f"{args.data_folder}/{args.env_id}/dqn.npz") as data:
-            X_dqn = data["states"].astype(np.float32)
-            T_dqn = data["actions"].astype(np.float32)
-            Y_dqn = np.concatenate([data["rewards"].astype(np.float32)[:, np.newaxis], data["next_states"].astype(np.float32), data["dones"].astype(np.float32)[:, np.newaxis]], axis=1)
-            done_dqn = data["dones"]
-        X = np.concatenate([X_random, X_dqn], axis=0)
-        T = np.concatenate([T_random, T_dqn], axis=0)
-        Y = np.concatenate([Y_random, Y_dqn], axis=0)
-        done = np.concatenate([done_random, done_dqn], axis=0)
-    else:
-        raise ValueError("Unknown data type")
-    
-    if args.reward_mapping == "angle":
-        Y[:, 0] = np.cos(X[:, 2]) # pole angle
+    X, T, Y, done = load_data(args, False)
+    X_test, T_test, Y_test, done_test = load_data(args, True)
 
     print(f"Data loaded: n_samples={len(X)}, n_features={X.shape[1]}")
 
-    n = len(X) // 10 # 100000
-    if args.data_type == "mix": n //= 2
-    test_size = int(n * args.validation_split) # 30000
-    data_sizes = [n, n // 2, n // 10, n // 20, n // 100]
+    data_sizes = [1000, 500, 100]  # [1000, 500, 100]
 
     target_names = ["Reward", "Cart_Position", "Cart_Velocity", "Pole_Angle", "Pole_Angular_Velocity", "Done"]
     for i, name in enumerate(target_names):
@@ -70,18 +75,12 @@ if __name__ == "__main__":
         os.makedirs(f"outputs/{args.env_id}", exist_ok=True)
         plt.savefig(f"outputs/{args.env_id}/{name}_distribution_{args.data_type}_{args.reward_mapping}.png")
 
-        plt.figure(figsize=(12, 8))
-        if 0 < i < 5:
-            valid_idx = np.where(done == 0)[0]
-        else:
-            valid_idx = np.arange(len(X))
-        print(f"Valid samples for target {name}: {len(valid_idx)}")
-        test_idx = np.random.choice(valid_idx, size=test_size, replace=False)
+        plt.figure(figsize=(18, 6))
         for idx, data_size in enumerate(data_sizes):
-            train_idx = np.random.choice(np.setdiff1d(valid_idx, test_idx), size=data_size, replace=False)
-            X_train, X_test = X[train_idx], X[test_idx]
-            T_train, T_test = T[train_idx], T[test_idx]
-            Y_train, Y_test = Y[train_idx, i], Y[test_idx, i]
+            train_idx = np.random.choice(len(X), size=data_size, replace=False)
+            X_train = X[train_idx]
+            T_train = T[train_idx]
+            Y_train, Y_test_gt = Y[train_idx, i], Y_test[..., i]
 
             print(f"Training CausalPFN with data size: {data_size}")
             causalpfn_cate = CATEEstimator(
@@ -94,46 +93,33 @@ if __name__ == "__main__":
             Y_test_hat = mu_0 * (1 - T_test) + mu_1 * T_test
 
             if i < 5:
-                rmse = np.sqrt(np.mean((Y_test_hat - Y_test) ** 2))
+                rmse = np.sqrt(np.mean((Y_test_hat - Y_test_gt) ** 2))
                 print(f"Data size: {data_size}, Test RMSE: {rmse}")
             else:
                 Y_test_pred = np.zeros_like(Y_test_hat)
                 Y_test_pred[Y_test_hat > 0.5] = 1
-                accuracy = np.mean((Y_test_pred == Y_test))
+                accuracy = np.mean((Y_test_pred == Y_test_gt))
                 print(f"Data size: {data_size}, Test Accuracy: {accuracy}")
 
-            plt.subplot(2, 3, idx + 1)
-            plt.scatter(mu_0[T_test == 0], Y_test[T_test == 0], alpha=0.1, label="T=0", color='blue', s=1)
-            plt.scatter(mu_1[T_test == 1], Y_test[T_test == 1], alpha=0.1, label="T=1", color='orange', s=1)
-            mini, maxi = np.min(Y_test), np.max(Y_test)
+            plt.subplot(1, 3, idx + 1)
+            plt.scatter(mu_0[T_test == 0], Y_test_gt[T_test == 0], alpha=0.1, label="T=0", color='tab:blue', s=1)
+            plt.scatter(mu_1[T_test == 1], Y_test_gt[T_test == 1], alpha=0.1, label="T=1", color='tab:orange', s=1)
+            mini, maxi = np.min(Y_test_gt), np.max(Y_test_gt)
             if i < 5: plt.plot([mini, maxi], [mini, maxi], 'k--', alpha=0.5)
-            plt.xlabel(f"Predicted {name}")
-            plt.ylabel(f"True {name}")
-            plt.title(f"Data size: {data_size}, {'RMSE' if i < 5 else 'Accuracy'}: {rmse if i < 5 else accuracy:.8f}")
-            plt.legend()
-        
-        if i == 0:
-            Y_test_hat = 1 - X_test[:, 2] ** 2 / 2  # approximate cos(x) = 1 - x^2/2 for baseline
-        elif i == 5:
-            Y_test_hat = np.zeros_like(Y_test)  # always not done for baseline
-        else:
-            Y_test_hat = X_test[:, i - 1]  # same next state for baseline
-
-        if i < 5:
-            rmse = np.sqrt(np.mean((Y_test_hat - Y_test) ** 2))
-            print(f"Baseline Test RMSE: {rmse}")
-        else:
-            accuracy = np.mean((Y_test_hat == Y_test))
-            print(f"Baseline Test Accuracy: {accuracy}")
-        plt.subplot(2, 3, len(data_sizes) + 1)
-        plt.scatter(Y_test_hat, Y_test, alpha=0.1, label="Baseline", color='green', s=1)
-        mini, maxi = np.min(Y_test), np.max(Y_test)
-        plt.plot([mini, maxi], [mini, maxi], 'k--', alpha=0.5)
-        plt.xlabel(f"Predicted {name}")
-        plt.ylabel(f"True {name}")
-        plt.title(f"Data size: {data_size}, {'RMSE' if i < 5 else 'Accuracy'}: {rmse if i < 5 else accuracy:.8f}")
-        plt.legend()
-
-
+            plt.xlabel(f"Predicted {name.replace('_', ' ')}", fontsize=18)
+            plt.ylabel(f"True {name.replace('_', ' ')}", fontsize=18)
+            left, right = plt.xlim()
+            bottom, top = plt.ylim()
+            mini = min(left, bottom)
+            maxi = max(right, top)
+            plt.xlim(mini, maxi)
+            plt.ylim(mini, maxi)
+            plt.xticks(fontsize=14)
+            plt.yticks(fontsize=14)
+            plt.title(f"Data size: {data_size}, {'RMSE' if i < 5 else 'Accuracy'}: {rmse if i < 5 else accuracy:.8f}", fontsize=20)
+            legend_dot0 = Line2D([0], [0], marker='o', color='tab:blue', linestyle='', markersize=6)
+            legend_dot1 = Line2D([0], [0], marker='o', color='tab:orange', linestyle='', markersize=6)
+            plt.legend([legend_dot0, legend_dot1], ["T=0", "T=1"], loc="upper left", fontsize=18)
+ 
         plt.tight_layout()
         plt.savefig(f"outputs/{args.env_id}/causalpfn_{name}_predictions_{args.data_type}_{args.reward_mapping}.png")

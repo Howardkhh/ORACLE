@@ -21,20 +21,11 @@ uv pip install -e CausalPFN
 
 # Usage
 
-### Download real and oracle data
-
-Download from [here](https://drive.google.com/file/d/1CaZDCUpWNVOF34nXT6P9VM59sCKLZVhT/view?usp=sharing) and unzip the data into `Cartpole/`.
-
-Note the oracle data has not been tested. There might be issue with them. Use with caution.
+### Help
+Use `-h` or `--help` to see all options for each script. For example:
 
 ```bash
-Cartpole
-└── data
-    └── Cartpole-v1
-        ├── dqn.npz # real data collected by trained DQN policy, note the reward is original reward (0 or 1)
-        ├── dqn_oracle_remapped.npz # oracle data collected by trained DQN policy, reward = cos(angle)
-        ├── random.npz # real data collected by random policy
-        └── random_oracle_remapped.npz # oracle data collected by random policy
+python collect_data.py -h
 ```
 
 ### Train DQN on Cartpole
@@ -44,24 +35,39 @@ cd cleanrl
 python cleanrl/dqn.py --env-id CartPole-v1 --save-model
 
 # replace your model path below
-python collect_data.py --model ../cleanrl/runs/CartPole-v1__dqn__1__1762724960/dqn.cleanrl_model
+cd ../Cartpole
+python collect_data.py --model ../cleanrl/runs/CartPole-v1__dqn__1__1762724960/dqn.cleanrl_model --method dqn
+
+python collect_data.py --method random
+
+python collect_data.py --model ../cleanrl/runs/CartPole-v1__dqn__1__1762724960/dqn.cleanrl_model --method dqn --is_validation_split
+
+python collect_data.py --method random --is_validation_split
+
 ```
 
 ### Evaluate CausalPFN on Cartpole
 
 ```bash
-cd CausalPFN
-python eval_causalpfn.py --data_type ["dqn", "random", "mix"] --reward_mapping: ["original", "angle"]
-```
-
-### Generate Oracle Data
-
-```bash
-cd CausalPFN
-python generate_oracle.py --reward_mapping ["original", "angle"]
+python eval_causalpfn.py --data_type "mix"
 ```
 
 ### Train DQN with offline data and oracle data
 
 ```bash
+python dqn_offline.py --env-id CartPole-v1 \
+                      --reward_mapping angle \
+                      --oracle both \
+                      --oracle_source causalpfn \
+                      --num_samples 500 \
+                      --method_ratio 0.5 \
+                      --seed 123 \
+                      --exp_name exp_name
+```
+
+### Train DQN online with CausalPFN as environment
+
+```bash
+python dqn.py --env-id CausalPFNCartPole-v0 \
+              --save_model
 ```

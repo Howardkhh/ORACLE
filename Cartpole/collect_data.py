@@ -1,15 +1,11 @@
 import os
 import random
-import time
 from dataclasses import dataclass
 from typing import Callable, Literal
 
 import gymnasium as gym
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
 import tyro
 
 from cleanrl.dqn import QNetwork
@@ -18,11 +14,12 @@ from cleanrl.dqn import QNetwork
 class Args:
     method: Literal["dqn", "random"] = "dqn"
     env_id: str = "CartPole-v1"
-    total_steps: int = 1000000
-    max_steps_per_episode: int = 500
+    total_steps: int = 1000
+    max_steps_per_episode: int = 100
     seed: int = 1
-    model: str = None
+    model: str = ""
     cuda: bool = True
+    is_validation_split: bool = False
 
 def make_env(env_id, seed):
     def thunk():
@@ -64,18 +61,19 @@ def collect(
             actions = torch.argmax(q_values, dim=1).cpu().numpy()
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
         done = np.logical_or(terminations, truncations)
-        rec_states[step - 1] = obs
-        rec_next_states[step - 1] = next_obs
-        rec_actions[step - 1] = actions
-        rec_rewards[step - 1] = rewards
-        rec_dones[step - 1] = done
+        rec_states[step - 1] = obs[0]
+        rec_next_states[step - 1] = next_obs[0]
+        rec_actions[step - 1] = actions[0]
+        rec_rewards[step - 1] = rewards[0]
+        rec_dones[step - 1] = done[0]
         if "final_info" in infos:
             done = True
+            rec_next_states[step - 1] = infos["final_observation"][0]
             for info in infos["final_info"]:
                 if "episode" not in info:
                     continue
                 print(f"eval_episode={step}, episodic_return={info['episode']['r']}")
-        if "final_info" in infos or step_in_episode > max_steps_per_episode:
+        if "final_info" in infos or step_in_episode >= max_steps_per_episode:
             obs, _ = envs.reset()
             step_in_episode = 0
             continue
@@ -106,10 +104,18 @@ if __name__ == "__main__":
 
     os.makedirs(f"data/{args.env_id}", exist_ok=True)
     np.savez_compressed(
-        f"data/{args.env_id}/{args.method}.npz",
+        f"data/{args.env_id}/{args.method}{'_validation' if args.is_validation_split else ''}.npz",
         states=states,
         next_states=next_states,
         actions=actions,
         rewards=rewards,
+        dones=dones,
+    )
+    np.savez_compressed(
+        f"data/{args.env_id}/{args.method}_remapped{'_validation' if args.is_validation_split else ''}.npz",
+        states=states,
+        next_states=next_states,
+        actions=actions,
+        rewards=np.cos(next_states[:, 2]),
         dones=dones,
     )
