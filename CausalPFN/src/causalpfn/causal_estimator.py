@@ -3,6 +3,7 @@ import os
 from abc import ABC
 from pathlib import Path
 from typing import Dict, Literal
+from collections import defaultdict
 
 import faiss
 import numpy as np
@@ -133,8 +134,11 @@ class CausalEstimator(ABC):
         self.X_train, self.t_train, self.y_train = None, None, None
         self.temperature = 1.0
         self.prediction_temperature = 1.0
+        self.has_new_context = False
 
         self.verbose = verbose
+
+        self.cache = defaultdict(lambda: None)
 
     def _check_fitted(self):
         if self.X_train is None or self.t_train is None or self.y_train is None or self.icl_model is None:
@@ -185,24 +189,40 @@ class CausalEstimator(ABC):
         if n_samples is not None:
             all_samples = np.zeros((X_query.shape[0], n_samples), dtype=X_query.dtype)
 
-        context_effects = self._estimate_cate_weak_learner(X_test=X_context)
-        treatmentgroup_2_context_idx = np.where(np.isclose(t_context, 1))[0]
-        controlgroup_2_context_idx = np.where(np.isclose(t_context, 0))[0]
-        context_treatment_group_effects = context_effects[treatmentgroup_2_context_idx]
-        context_control_group_effects = context_effects[controlgroup_2_context_idx]
+        if self.has_new_context:
+            context_effects = self._estimate_cate_weak_learner(X_test=X_context)
+            treatmentgroup_2_context_idx = np.where(np.isclose(t_context, 1))[0]
+            controlgroup_2_context_idx = np.where(np.isclose(t_context, 0))[0]
+            context_treatment_group_effects = context_effects[treatmentgroup_2_context_idx]
+            context_control_group_effects = context_effects[controlgroup_2_context_idx]
+            index_treatment = faiss.IndexFlatL2(1)
+            index_treatment.add(
+                np.ascontiguousarray(context_treatment_group_effects.reshape(-1, 1).copy(), dtype=np.float32)
+            )
+            index_control = faiss.IndexFlatL2(1)
+            index_control.add(np.ascontiguousarray(context_control_group_effects.reshape(-1, 1).copy(), dtype=np.float32))
+            self.cache["treatmentgroup_2_context_idx"] = treatmentgroup_2_context_idx
+            self.cache["controlgroup_2_context_idx"] = controlgroup_2_context_idx
+            self.cache["context_treatment_group_effects"] = context_treatment_group_effects
+            self.cache["context_control_group_effects"] = context_control_group_effects
+            self.cache["index_treatment"] = index_treatment
+            self.cache["index_control"] = index_control
+            self.has_new_context = False
+        else:
+            treatmentgroup_2_context_idx = self.cache["treatmentgroup_2_context_idx"]
+            controlgroup_2_context_idx = self.cache["controlgroup_2_context_idx"]
+            context_treatment_group_effects = self.cache["context_treatment_group_effects"]
+            context_control_group_effects = self.cache["context_control_group_effects"]
+            index_treatment = self.cache["index_treatment"]
+            index_control = self.cache["index_control"]
+
 
         query_effects = self._estimate_cate_weak_learner(X_test=X_query)
         query_indices_sorted = np.argsort(query_effects)
 
-        index_treatment = faiss.IndexFlatL2(1)
-        index_treatment.add(
-            np.ascontiguousarray(context_treatment_group_effects.reshape(-1, 1).copy(), dtype=np.float32)
-        )
         _, query_neighbour_indices_treatment = index_treatment.search(
             np.ascontiguousarray(query_effects.reshape(-1, 1).copy(), dtype=np.float32), k=self.num_neighbours
         )
-        index_control = faiss.IndexFlatL2(1)
-        index_control.add(np.ascontiguousarray(context_control_group_effects.reshape(-1, 1).copy(), dtype=np.float32))
         _, query_neighbour_indices_control = index_control.search(
             np.ascontiguousarray(query_effects.reshape(-1, 1).copy(), dtype=np.float32), k=self.num_neighbours
         )
@@ -432,6 +452,8 @@ class CausalEstimator(ABC):
         self.X_train = X
         self.t_train = t
         self.y_train = y
+
+        self.has_new_context = True
 
         # train a lightweight stratification model to use whenever the context length is too large
         # this ensures that the data will be stratified and the context would only look at the most relevant samples

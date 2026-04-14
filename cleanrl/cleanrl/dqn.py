@@ -3,6 +3,7 @@ import os
 import random
 import time
 from dataclasses import dataclass
+from typing import Literal
 
 import gymnasium as gym
 import numpy as np
@@ -10,10 +11,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import cv2
 import tyro
 from torch.utils.tensorboard import SummaryWriter
 
 from cleanrl_utils.buffers import ReplayBuffer
+from cleanrl_utils.custom_wrappers import DINOv2FeatureWrapper, RenderObservation, PreprocessObservation
 
 
 @dataclass
@@ -70,15 +73,33 @@ class Args:
     """timestep to start learning"""
     train_frequency: int = 10
     """the frequency of training"""
+    observation_mode: Literal['state', 'image', 'feature'] = 'state'
+    """the observation mode of the environment"""
+    stack_frames: int = 1
+    """the number of frames to stack"""
 
 
-def make_env(env_id, seed, idx, capture_video, run_name):
+def make_env(env_id, seed, idx, capture_video, run_name, stack_frames=1, observation_mode='state'):
     def thunk():
         if capture_video and idx == 0:
             env = gym.make(env_id, render_mode="rgb_array")
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
-            env = gym.make(env_id)
+            render_mode = "rgb_array" if observation_mode in ['image', 'feature'] else None
+            env = gym.make(env_id, render_mode=render_mode)
+
+        if observation_mode == 'image' or observation_mode == 'feature':
+            env = RenderObservation(env)
+
+        if observation_mode == 'image':
+            env = gym.wrappers.GrayScaleObservation(env, keep_dim=True)
+            env = PreprocessObservation(env)
+        if observation_mode == 'feature':
+            env = DINOv2FeatureWrapper(env)
+
+        if stack_frames > 1:
+            env = gym.wrappers.FrameStack(env, stack_frames)
+
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env.action_space.seed(seed)
 
@@ -89,17 +110,62 @@ def make_env(env_id, seed, idx, capture_video, run_name):
 
 # ALGO LOGIC: initialize agent here:
 class QNetwork(nn.Module):
-    def __init__(self, env):
+
+    def __init__(self, env, observation_mode):
         super().__init__()
+
+        self.observation_mode = observation_mode
+        input_dim = np.array(env.observation_space.shape).prod()
+
+        if self.observation_mode == 'image':
+            if len(env.observation_space.shape) == 4:
+                num_channels = 1 * env.observation_space.shape[0]
+            else:
+                num_channels = 1
+            self.image_encoder = nn.Sequential(
+                nn.Conv2d(num_channels, 32, kernel_size=8, stride=4),
+                nn.ReLU(),
+                nn.Conv2d(32, 64, kernel_size=8, stride=4),
+                nn.ReLU(),
+                nn.Conv2d(64, 64, kernel_size=3, stride=1),
+                nn.ReLU(),
+                nn.Flatten(),
+            )
+            input_dim = self.image_encoder(torch.zeros(1, num_channels, 240, 160)).shape[1]
+            print(f"Image encoder output dimension: {input_dim}")
+        
         self.network = nn.Sequential(
-            nn.Linear(np.array(env.single_observation_space.shape).prod(), 120),
+            nn.Linear(input_dim, 512),
             nn.ReLU(),
-            nn.Linear(120, 84),
+            nn.Linear(512, 256),
             nn.ReLU(),
-            nn.Linear(84, env.single_action_space.n),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, env.action_space.n),
         )
+    
+    def preprocess(self, x: torch.Tensor):
+        if self.observation_mode == 'image':
+            if x.ndim == 3:
+                x = x.permute(2, 0, 1).unsqueeze(0)  # HWC to BCHW
+            elif x.ndim == 4:
+                x = x.permute(0, 3, 1, 2)  # NHWC to NCHW
+            elif x.ndim == 5:
+                b, s, h, w, c = x.shape
+                x = x.permute(0, 1, 4, 2, 3).reshape(b, s*c, h, w)  # N(s)HWC to N(sC)HW
+        elif self.observation_mode == 'feature':
+            if x.ndim == 3:
+                b, s, d = x.shape
+                x = x.reshape(b, s*d)  # N(sD)
+            elif x.ndim == 2:
+                s, d = x.shape
+                x = x.reshape(s*d)  # (sD)
+        return x
 
     def forward(self, x):
+        x = self.preprocess(x)
+        if self.observation_mode == 'image':
+            x = self.image_encoder(x)
         return self.network(x)
 
 
@@ -140,13 +206,13 @@ if __name__ == "__main__":
 
     # env setup
     envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
+        [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name, args.stack_frames, args.observation_mode) for i in range(args.num_envs)]
     )
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
-    q_network = QNetwork(envs).to(device)
+    q_network = QNetwork(envs, args.observation_mode).to(device)
     optimizer = optim.Adam(q_network.parameters(), lr=args.learning_rate)
-    target_network = QNetwork(envs).to(device)
+    target_network = QNetwork(envs, args.observation_mode).to(device)
     target_network.load_state_dict(q_network.state_dict())
 
     rb = ReplayBuffer(
@@ -166,6 +232,7 @@ if __name__ == "__main__":
         if random.random() < epsilon:
             actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
         else:
+            q_network.eval()
             q_values = q_network(torch.Tensor(obs).to(device))
             actions = torch.argmax(q_values, dim=1).cpu().numpy()
 
@@ -176,7 +243,7 @@ if __name__ == "__main__":
         if "final_info" in infos:
             for info in infos["final_info"]:
                 if info and "episode" in info:
-                    print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
+                    print(f"global_step={global_step}, episodic_return={info['episode']['r']}", end="\r")
                     writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
                     writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
 
@@ -193,6 +260,7 @@ if __name__ == "__main__":
         # ALGO LOGIC: training.
         if global_step > args.learning_starts:
             if global_step % args.train_frequency == 0:
+                q_network.train()
                 data = rb.sample(args.batch_size)
                 with torch.no_grad():
                     target_max, _ = target_network(data.next_observations).max(dim=1)
@@ -203,7 +271,7 @@ if __name__ == "__main__":
                 if global_step % 100 == 0:
                     writer.add_scalar("losses/td_loss", loss, global_step)
                     writer.add_scalar("losses/q_values", old_val.mean().item(), global_step)
-                    print("SPS:", int(global_step / (time.time() - start_time)))
+                    # print("SPS:", int(global_step / (time.time() - start_time)))
                     writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
                 # optimize the model
@@ -224,16 +292,16 @@ if __name__ == "__main__":
         print(f"model saved to {model_path}")
         from cleanrl_utils.evals.dqn_eval import evaluate
 
+        eval_envs = gym.vector.SyncVectorEnv([make_env(args.env_id, 0, 0, True, f"{run_name}-eval", args.stack_frames, args.observation_mode)])
         episodic_returns = evaluate(
             model_path,
-            make_env,
-            args.env_id,
+            eval_envs,
             eval_episodes=10,
-            run_name=f"{run_name}-eval",
-            Model=QNetwork,
+            model=QNetwork(eval_envs, args.observation_mode),
             device=device,
             epsilon=args.end_e,
         )
+        eval_envs.close()
         for idx, episodic_return in enumerate(episodic_returns):
             writer.add_scalar("eval/episodic_return", episodic_return, idx)
 
